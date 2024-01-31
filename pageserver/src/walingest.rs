@@ -1356,10 +1356,8 @@ impl WalIngest {
             offset = offset.wrapping_add(n_this_page as u32);
         }
         if xlrec.mid.wrapping_sub(self.checkpoint.nextMulti) as i32 >= 0 {
-            let next_mid = std::cmp::max(
-                xlrec.mid.wrapping_add(1),
-                pg_constants::FIRST_MULTIXACT_ID,
-            );
+            let next_mid =
+                std::cmp::max(xlrec.mid.wrapping_add(1), pg_constants::FIRST_MULTIXACT_ID);
             self.checkpoint.nextMulti = next_mid;
             self.checkpoint_modified = true;
         }
