@@ -2555,7 +2555,7 @@ impl Timeline {
         // Start from the current timeline.
         let mut timeline_owned;
         let mut timeline = self;
-        let mut ancestor_branchpoint = self.ancestor_branchpoint.read().unwrap().clone();
+        let mut ancestor_branchpoint = self.ancestor_branchpoint.snapshot();
 
         let mut read_count = scopeguard::guard(0, |cnt| {
             crate::metrics::READ_NUM_FS_LAYERS.observe(cnt as f64)
@@ -2641,7 +2641,7 @@ impl Timeline {
                     ancestor.ready_ancestor_for_lsn(*ancestor_lsn, ctx).await?;
                     timeline_owned = ancestor.clone();
                     timeline = &*timeline_owned;
-                    ancestor_branchpoint = timeline.ancestor_branchpoint.read().unwrap().clone();
+                    ancestor_branchpoint = timeline.ancestor_branchpoint.snapshot();
                     prev_lsn = None;
                     continue 'outer;
                 }
@@ -2770,7 +2770,7 @@ impl Timeline {
     ) -> Result<(), GetVectoredError> {
         let mut timeline_owned: Arc<Timeline>;
         let mut timeline = self;
-        let mut ancestor_branchpoint = timeline.ancestor_branchpoint.read().unwrap().clone();
+        let mut ancestor_branchpoint = timeline.ancestor_branchpoint.snapshot();
 
         let mut cont_lsn = Lsn(request_lsn.0 + 1);
 
@@ -2806,7 +2806,7 @@ impl Timeline {
                 .map_err(GetVectoredError::GetReadyAncestorError)?;
             timeline_owned = ancestor;
             timeline = &*timeline_owned;
-            ancestor_branchpoint = timeline.ancestor_branchpoint.read().unwrap().clone();
+            ancestor_branchpoint = timeline.ancestor_branchpoint.snapshot();
         }
 
         if keyspace.total_size() != 0 {
@@ -3295,18 +3295,13 @@ impl Timeline {
             None
         };
 
-        let ancestor_branchpoint = self
-            .ancestor_branchpoint
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|(a, lsn)| (a.timeline_id, *lsn));
+        let (ancestor_id, ancestor_lsn) = self.ancestor_branchpoint.as_id_lsn_pair();
 
         let metadata = TimelineMetadata::new(
             disk_consistent_lsn,
             ondisk_prev_record_lsn,
-            ancestor_branchpoint.map(|x| x.0),
-            ancestor_branchpoint.map(|x| x.1).unwrap_or(Lsn::INVALID),
+            ancestor_id,
+            ancestor_lsn.unwrap_or(Lsn::INVALID),
             *self.latest_gc_cutoff_lsn.read(),
             self.initdb_lsn,
             self.pg_version,
