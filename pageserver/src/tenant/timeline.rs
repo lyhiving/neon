@@ -183,7 +183,43 @@ pub(crate) struct AuxFilesState {
 
 pub(crate) struct Branchpoint(RwLock<Option<(Arc<Timeline>, Lsn)>>);
 
+#[derive(Debug)]
+enum ReparentTimelineError {
+    AncestorMismatch,
+    NoAncestor,
+}
+
 impl Branchpoint {
+    #[allow(unused)]
+    fn detach(&self, expected: &Arc<Timeline>) -> bool {
+        let mut g = self.0.write().unwrap();
+
+        match &*g {
+            Some((ancestor, _)) if Arc::ptr_eq(ancestor, expected) => {
+                g.take();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    #[allow(unused)]
+    fn reparent(
+        &self,
+        from: &Arc<Timeline>,
+        to: &Arc<Timeline>,
+    ) -> Result<(), ReparentTimelineError> {
+        use ReparentTimelineError::*;
+        let mut g = self.0.write().unwrap();
+        let ancestor_lsn = match &*g {
+            Some((ancestor, ancestor_lsn)) if Arc::ptr_eq(ancestor, from) => *ancestor_lsn,
+            Some(_) => return Err(AncestorMismatch),
+            None => return Err(NoAncestor),
+        };
+        *g = Some((to.clone(), ancestor_lsn));
+        Ok(())
+    }
+
     pub(super) fn as_id_lsn(&self) -> Option<(TimelineId, Lsn)> {
         Option::from(self)
     }
