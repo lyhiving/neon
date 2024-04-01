@@ -2810,7 +2810,7 @@ impl Tenant {
 
                 timelines
                     .iter()
-                    .map(|(timeline_id, timeline_entry)| {
+                    .inspect(|(_, timeline_entry)| {
                         if let Some(ancestor_timeline_id) =
                             &timeline_entry.get_ancestor_timeline_id()
                         {
@@ -2831,9 +2831,8 @@ impl Tenant {
                                 ));
                             }
                         }
-
-                        *timeline_id
                     })
+                    .map(|(timeline_id, _)| *timeline_id)
                     .collect::<Vec<_>>()
             };
             (all_branchpoints, timeline_ids)
