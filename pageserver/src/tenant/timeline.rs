@@ -3882,13 +3882,15 @@ impl Timeline {
             tracing::debug!(to_rewrite = %straddling_branchpoint.len(), "copying prefix of delta layers");
 
             for layer in straddling_branchpoint {
+                // FIXME: can't ever remember this, is it needed or not?
+                const OFF_BY_ONE: u64 = 1;
+
                 let mut writer = DeltaLayerWriter::new(
                     self.conf,
                     self.timeline_id,
                     self.tenant_shard_id,
                     layer.layer_desc().key_range.start,
-                    // off by one here?
-                    layer.layer_desc().lsn_range.start..ancestor_lsn,
+                    layer.layer_desc().lsn_range.start..(ancestor_lsn + OFF_BY_ONE),
                 )
                 .await
                 .map_err(CopyDeltaPrefix)?;
@@ -3900,7 +3902,7 @@ impl Timeline {
                     .map_err(RewrittenDeltaDownloadFailed)?;
 
                 let records = resident
-                    .copy_delta_prefix(&mut writer, ancestor_lsn, ctx)
+                    .copy_delta_prefix(&mut writer, ancestor_lsn + OFF_BY_ONE, ctx)
                     .await
                     .map_err(CopyDeltaPrefix)?;
 
