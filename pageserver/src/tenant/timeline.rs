@@ -234,6 +234,18 @@ impl Branchpoint {
     fn snapshot(&self) -> Option<(Arc<Timeline>, Lsn)> {
         self.0.read().unwrap().clone()
     }
+
+    fn is_some(&self) -> bool {
+        self.0.read().unwrap().is_some()
+    }
+
+    /// Like [`Option::and_then`]
+    fn and_then<U, F>(&self, f: F) -> Option<U>
+    where
+        F: FnOnce(&(Arc<Timeline>, Lsn)) -> Option<U>,
+    {
+        self.0.read().unwrap().as_ref().and_then(f)
+    }
 }
 
 impl<'a> From<&'a Branchpoint> for Lsn {
