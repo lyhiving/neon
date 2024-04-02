@@ -57,6 +57,9 @@ def test_ancestor_detach_with_restart_after(neon_env_builder: NeonEnvBuilder):
 
     do_this = True
 
+    # does false cause a missing previous lsn?
+    # no it's zenith.signal check between prev lsn being "invalid" or "none" without a hack
+
     if do_this:
         with env.endpoints.create_start("new_main", tenant_id = env.initial_tenant) as ep:
             assert ep.safe_psql("SELECT count(*) FROM foo;")[0][0] == 16384
