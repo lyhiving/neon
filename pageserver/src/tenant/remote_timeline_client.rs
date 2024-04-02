@@ -649,18 +649,22 @@ impl RemoteTimelineClient {
         self: &Arc<Self>,
         _adopted: (TimelineId, Lsn),
     ) -> anyhow::Result<impl std::future::Future<Output = anyhow::Result<()>> + 'static> {
-        // FIXME: because of how Timeline::schedule_uploads works when called from layer flushing
-        // and reads the in-memory part we cannot do the detaching like this
-
         let mut guard = self.upload_queue.lock().unwrap();
         let upload_queue = guard.initialized_mut()?;
 
-        upload_queue
-            .latest_metadata
-            .detach_from_ancestor(&_adopted.0, &_adopted.1);
+        // FIXME: need to also upload it in case there is no ancestor but the lineage has not been
+        // updated
+        if upload_queue.latest_metadata.ancestor_timeline().is_some() {
+            upload_queue
+                .latest_metadata
+                .detach_from_ancestor(&_adopted.0, &_adopted.1);
 
-        self.schedule_index_upload(upload_queue, upload_queue.latest_metadata.clone());
+            self.schedule_index_upload(upload_queue, upload_queue.latest_metadata.clone());
+        } else {
+            // there was already a scheduled upload without ancestor, or it had happned way before
+        }
 
+        // lets wait something out regardless
         let receiver = self.schedule_barrier0(upload_queue);
 
         drop(guard);
