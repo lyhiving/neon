@@ -270,6 +270,7 @@ impl SharedState {
             backup_lsn: self.sk.state.inmem.backup_lsn.0,
             local_start_lsn: self.sk.state.local_start_lsn.0,
             availability_zone: conf.availability_zone.clone(),
+            standby_horizon: self.sk.state.inmem.standby_horizon.0,
         }
     }
 
@@ -663,7 +664,9 @@ impl Timeline {
 
             // if this is AppendResponse, fill in proper hot standby feedback.
             if let Some(AcceptorProposerMessage::AppendResponse(ref mut resp)) = rmsg {
-                resp.hs_feedback = self.walsenders.get_hotstandby();
+                let standby_feedback = self.walsenders.get_hotstandby();
+                resp.hs_feedback = standby_feedback.hs_feedback;
+                shared_state.sk.state.inmem.standby_horizon = standby_feedback.reply.apply_lsn;
             }
 
             commit_lsn = shared_state.sk.state.inmem.commit_lsn;

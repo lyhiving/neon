@@ -609,6 +609,17 @@ impl ConnectionManagerState {
     fn register_timeline_update(&mut self, timeline_update: SafekeeperTimelineInfo) {
         WALRECEIVER_BROKER_UPDATES.inc();
 
+        info!(
+            "Safekeeper info update: standby_horizon(cutoff)={}",
+            timeline_update.standby_horizon
+        );
+        if timeline_update.standby_horizon != 0 {
+            // ignore reports from safekeepers mnot connected to replicas
+            self.timeline
+                .standby_horizon
+                .store(Lsn(timeline_update.standby_horizon));
+        }
+
         let new_safekeeper_id = NodeId(timeline_update.safekeeper_id);
         let old_entry = self.wal_stream_candidates.insert(
             new_safekeeper_id,
@@ -979,6 +990,7 @@ mod tests {
                 remote_consistent_lsn: 0,
                 peer_horizon_lsn: 0,
                 local_start_lsn: 0,
+                standby_horizon: 0,
                 safekeeper_connstr: safekeeper_connstr.to_owned(),
                 http_connstr: safekeeper_connstr.to_owned(),
                 availability_zone: None,

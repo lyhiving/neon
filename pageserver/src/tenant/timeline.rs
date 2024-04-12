@@ -227,6 +227,8 @@ pub struct Timeline {
     // Atomic would be more appropriate here.
     last_freeze_ts: RwLock<Instant>,
 
+    pub(crate) standby_horizon: AtomicLsn,
+
     // WAL redo manager. `None` only for broken tenants.
     walredo_mgr: Option<Arc<super::WalRedoManager>>,
 
@@ -1908,6 +1910,8 @@ impl Timeline {
 
                 compaction_lock: tokio::sync::Mutex::default(),
                 gc_lock: tokio::sync::Mutex::default(),
+
+                standby_horizon: AtomicLsn::new(0),
 
                 timeline_get_throttle: resources.timeline_get_throttle,
 
@@ -4190,6 +4194,15 @@ impl Timeline {
         };
 
         let new_gc_cutoff = Lsn::min(horizon_cutoff, pitr_cutoff);
+        let standby_horizon = self.standby_horizon.load();
+        let new_gc_cutoff = if standby_horizon != Lsn::INVALID {
+            Lsn::min(standby_horizon, new_gc_cutoff)
+        } else {
+            new_gc_cutoff
+        };
+
+        // Reset standby horizon to ignore  it if it is not updated till next GC
+        self.standby_horizon.store(Lsn::INVALID);
 
         let res = self
             .gc_timeline(horizon_cutoff, pitr_cutoff, retain_lsns, new_gc_cutoff)
