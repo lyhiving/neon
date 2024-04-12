@@ -1923,7 +1923,7 @@ CombineHotStanbyFeedbacks(HotStandbyFeedback *hs, WalProposer *wp)
 
 	for (int i = 0; i < wp->n_safekeepers; i++)
 	{
- 		if (wp->safekeeper[i].appendResponse.hs.ts != 0)
+		if (wp->safekeeper[i].appendResponse.hs.ts != 0)
 		{
 			HotStandbyFeedback *skhs = &wp->safekeeper[i].appendResponse.hs;
 
