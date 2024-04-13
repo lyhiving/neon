@@ -4,6 +4,7 @@ from fixtures.log_helper import log
 from fixtures.neon_fixtures import NeonEnv, PgBin, wait_replica_caughtup
 
 
+# Exercise standby under aggressive gc to test for 'page had been already garbage collected' errors
 def test_replication_lag(neon_simple_env: NeonEnv, pg_bin: PgBin):
     env = neon_simple_env
     n_iterations = 60
