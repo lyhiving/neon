@@ -193,7 +193,7 @@ impl WalSenders {
     fn record_standby_reply(self: &Arc<WalSenders>, id: WalSenderId, reply: &StandbyReply) {
         let mut shared = self.mutex.lock();
         let slot = shared.get_slot_mut(id);
-        info!(
+        debug!(
             "Record standby reply: ts={} apply_lsn={}",
             reply.reply_ts, reply.apply_lsn
         );
@@ -273,7 +273,7 @@ impl WalSendersShared {
         self.slots[id].as_mut().expect("walsender doesn't exist")
     }
 
-    /// Update aggregated hot standy feedback. We just take min of valid xmins
+    /// Update aggregated hot standy and normal reply feedbacks. We just take min of valid xmins
     /// and ts.
     fn update_reply_feedback(&mut self) {
         let mut agg = HotStandbyFeedback::empty();
