@@ -1,4 +1,5 @@
 import threading
+import time
 
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import NeonEnv, PgBin, wait_replica_caughtup
@@ -30,28 +31,23 @@ def test_replication_lag(neon_simple_env: NeonEnv, pg_bin: PgBin):
     ) as primary:
         pg_bin.run_capture(["pgbench", "-i", "-s10", primary.connstr()])
 
-        t = threading.Thread(target=run_pgbench, args=(primary.connstr(),), daemon=True)
+        t = threading.Thread(target=run_pgbench, args=(primary.connstr(),))
         t.start()
 
         with env.endpoints.new_replica_start(origin=primary, endpoint_id="secondary") as secondary:
             wait_replica_caughtup(primary, secondary)
+            # let primary receive hot standby feedback
+            time.sleep(10)
             for _ in range(1, n_iterations):
-                try:
-                    primary_lsn = primary.safe_psql_scalar(
-                        "SELECT pg_current_wal_flush_lsn()::text", log_query=False
-                    )
-                    secondary_lsn = secondary.safe_psql_scalar(
-                        "SELECT pg_last_wal_replay_lsn()", log_query=False
-                    )
-                    balance = secondary.safe_psql_scalar(
-                        "select sum(abalance) from pgbench_accounts"
-                    )
-                    log.info(
-                        f"primary_lsn={primary_lsn}, secondary_lsn={secondary_lsn}, balance={balance}"
-                    )
-                except Exception as error:
-                    print(f"Query failed: {error}")
-                    if "canceling statement due to conflict with recovery" not in str(error):
-                        raise
+                primary_lsn = primary.safe_psql_scalar(
+                    "SELECT pg_current_wal_flush_lsn()::text", log_query=False
+                )
+                secondary_lsn = secondary.safe_psql_scalar(
+                    "SELECT pg_last_wal_replay_lsn()", log_query=False
+                )
+                balance = secondary.safe_psql_scalar("select sum(abalance) from pgbench_accounts")
+                log.info(
+                    f"primary_lsn={primary_lsn}, secondary_lsn={secondary_lsn}, balance={balance}"
+                )
 
         t.join()
