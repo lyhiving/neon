@@ -1,5 +1,4 @@
 import threading
-import time
 
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import NeonEnv, PgBin, wait_replica_caughtup
@@ -32,12 +31,15 @@ def test_replication_lag(neon_simple_env: NeonEnv, pg_bin: PgBin):
         pg_bin.run_capture(["pgbench", "-i", "-s10", primary.connstr()])
 
         t = threading.Thread(target=run_pgbench, args=(primary.connstr(),))
-        t.start()
 
-        with env.endpoints.new_replica_start(origin=primary, endpoint_id="secondary") as secondary:
+        with env.endpoints.new_replica_start(
+            origin=primary,
+            endpoint_id="secondary",
+            config_lines=["max_standby_streaming_delay=100s"],
+        ) as secondary:
             wait_replica_caughtup(primary, secondary)
+            t.start()
             # let primary receive hot standby feedback
-            time.sleep(10)
             for _ in range(1, n_iterations):
                 primary_lsn = primary.safe_psql_scalar(
                     "SELECT pg_current_wal_flush_lsn()::text", log_query=False
