@@ -234,6 +234,14 @@ impl SimulationApi {
             shard_number: 0,
         };
 
+        let empty_sk_shmem = walproposer::bindings::SafekeeperShmemState {
+            flushLsn: pg_atomic_uint64 { value: 0 },
+            state: pg_atomic_uint64 { value: 0 },
+            conninfo: [0; 1024],
+            host: std::ptr::null(),
+            port: std::ptr::null(),
+        };
+
         Self {
             os: args.os,
             safekeepers: RefCell::new(sk_conns),
@@ -241,8 +249,12 @@ impl SimulationApi {
             redo_start_lsn: args.redo_start_lsn,
             last_logged_commit_lsn: 0,
             shmem: UnsafeCell::new(walproposer::bindings::WalproposerShmemState {
+                n_safekeepers: 0,
+                epochStartLsn: pg_atomic_uint64 { value: 0 },
+                propTerm : pg_atomic_uint64 { value : 0 },
+                donor : pg_atomic_uint64 { value : 0 },
+                safekeeper: [empty_sk_shmem; 32],
                 mutex: 0,
-                mineLastElectedTerm: 0,
                 backpressureThrottlingTime: pg_atomic_uint64 { value: 0 },
                 currentClusterSize: pg_atomic_uint64 { value: 0 },
                 shard_ps_feedback: [empty_feedback; 128],
@@ -256,7 +268,7 @@ impl SimulationApi {
 
     /// Get SafekeeperConn for the given Safekeeper.
     fn get_conn(&self, sk: &mut walproposer::bindings::Safekeeper) -> RefMut<'_, SafekeeperConn> {
-        let sk_port = unsafe { CStr::from_ptr(sk.port).to_str().unwrap() };
+        let sk_port = unsafe { CStr::from_ptr((*(sk.shared)).port).to_str().unwrap() };
         let state = self.safekeepers.borrow_mut();
         RefMut::map(state, |v| {
             v.iter_mut()
@@ -456,7 +468,8 @@ impl ApiImpl for SimulationApi {
     fn active_state_update_event_set(&self, sk: &mut walproposer::bindings::Safekeeper) {
         debug!("active_state_update_event_set");
 
-        assert!(sk.state == walproposer::bindings::SafekeeperState_SS_ACTIVE);
+        let state = unsafe { (*sk.shared).state.value } as u32;
+        assert!(state == walproposer::bindings::SafekeeperState_SS_ACTIVE);
         self.event_set
             .borrow_mut()
             .as_mut()

@@ -83,6 +83,7 @@ fn main() -> anyhow::Result<()> {
         .allowlist_function("WalProposerPoll")
         .allowlist_function("WalProposerFree")
         .allowlist_function("SafekeeperStateDesiredEvents")
+        .allowlist_function("GetWalpropShmemState")
         .allowlist_var("DEBUG5")
         .allowlist_var("DEBUG4")
         .allowlist_var("DEBUG3")

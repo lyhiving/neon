@@ -284,6 +284,10 @@ typedef struct PageserverFeedback
 
 typedef struct WalproposerShmemState
 {
+	XLogRecPtr	propEpochStartLsn;
+	char donor_name[64];
+	char donor_conninfo[MAXCONNINFO];
+
 	slock_t		mutex;
 	term_t		mineLastElectedTerm;
 	pg_atomic_uint64 backpressureThrottlingTime;
@@ -716,12 +720,14 @@ extern void WalProposerBroadcast(WalProposer *wp, XLogRecPtr startpos, XLogRecPt
 extern void WalProposerPoll(WalProposer *wp);
 extern void WalProposerFree(WalProposer *wp);
 
+extern WalproposerShmemState *GetWalpropShmemState();
+
 /*
  * WaitEventSet API doesn't allow to remove socket, so walproposer_pg uses it to
  * recreate set from scratch, hence the export.
  */
 extern void SafekeeperStateDesiredEvents(Safekeeper *sk, uint32 *sk_events, uint32 *nwr_events);
-extern Safekeeper *GetDonor(WalProposer *wp, XLogRecPtr *donor_lsn);
+extern TimeLineID walprop_pg_get_timeline_id(void);
 
 
 #define WPEVENT		1337		/* special log level for walproposer internal

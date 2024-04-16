@@ -80,7 +80,16 @@ static int	CompareLsn(const void *a, const void *b);
 static char *FormatSafekeeperState(Safekeeper *sk);
 static void AssertEventsOkForState(uint32 events, Safekeeper *sk);
 static char *FormatEvents(WalProposer *wp, uint32 events);
+static void UpdateDonorShmem(WalProposer *wp);
 
+
+#ifdef WALPROPOSER_LIB
+WalproposerShmemState *GetWalpropShmemState()
+{
+    static WalproposerShmemState state;
+    return &state;
+}
+#endif
 
 WalProposer *
 WalProposerCreate(WalProposerConfig *config, walproposer_api api)
@@ -89,10 +98,13 @@ WalProposerCreate(WalProposerConfig *config, walproposer_api api)
 	char	   *sep;
 	char	   *port;
 	WalProposer *wp;
+	WalproposerShmemState *wps;
 
 	wp = palloc0(sizeof(WalProposer));
 	wp->config = config;
 	wp->api = api;
+
+	wps = wp->api.get_shmem_state(wp);
 
 	for (host = wp->config->safekeepers_list; host != NULL && *host != '\0'; host = sep)
 	{
@@ -725,6 +737,7 @@ RecvAcceptorGreeting(Safekeeper *sk)
 			   sk->host, sk->port,
 			   sk->greetResponse.term, wp->propTerm);
 	}
+	wp->api.get_shmem_state(wp)->mineLastElectedTerm = wp->propTerm;
 
 	/*
 	 * Check if we have quorum. If there aren't enough safekeepers, wait and
@@ -984,6 +997,7 @@ DetermineEpochStartLsn(WalProposer *wp)
 		}
 		wp_log(LOG, "bumped epochStartLsn to the first record %X/%X", LSN_FORMAT_ARGS(wp->propEpochStartLsn));
 	}
+        *(volatile XLogRecPtr *)&wp->api.get_shmem_state(wp)->propEpochStartLsn = wp->propEpochStartLsn;
 
 	/*
 	 * Safekeepers are setting truncateLsn after timelineStartLsn is known, so it
@@ -1176,6 +1190,7 @@ StartStreaming(Safekeeper *sk)
 	sk->state = SS_ACTIVE;
 	sk->active_state = SS_ACTIVE_SEND;
 	sk->streamingAt = sk->startStreamingAt;
+        UpdateDonorShmem(sk->wp);
 
 	/* event set will be updated inside SendMessageToNode */
 	SendMessageToNode(sk);
@@ -1568,17 +1583,19 @@ GetAcknowledgedByQuorumWALPosition(WalProposer *wp)
  * none if it doesn't exist. donor_lsn is set to end position of the donor to
  * the best of our knowledge.
  */
-Safekeeper *
-GetDonor(WalProposer *wp, XLogRecPtr *donor_lsn)
+static void
+UpdateDonorShmem(WalProposer *wp)
 {
 	Safekeeper *donor = NULL;
 	int			i;
-	*donor_lsn = InvalidXLogRecPtr;
+        XLogRecPtr donor_lsn = InvalidXLogRecPtr;
+        WalproposerShmemState *wps = GetWalpropShmemState();
+	char donor_name[64];
 
 	if (wp->n_votes < wp->quorum)
 	{
-		wp_log(WARNING, "GetDonor called before elections are won");
-		return NULL;
+		wp_log(WARNING, "UpdateDonorShmem called before elections are won");
+		return;
 	}
 
 	/*
@@ -1589,7 +1606,7 @@ GetDonor(WalProposer *wp, XLogRecPtr *donor_lsn)
 	if (wp->safekeeper[wp->donor].state >= SS_IDLE)
 	{
 		donor = &wp->safekeeper[wp->donor];
-		*donor_lsn = wp->propEpochStartLsn;
+		donor_lsn = wp->propEpochStartLsn;
 	}
 
 	/*
@@ -1601,13 +1618,24 @@ GetDonor(WalProposer *wp, XLogRecPtr *donor_lsn)
 	{
 		Safekeeper *sk = &wp->safekeeper[i];
 
-		if (sk->state == SS_ACTIVE && sk->appendResponse.flushLsn > *donor_lsn)
+		if (sk->state == SS_ACTIVE && sk->appendResponse.flushLsn > donor_lsn)
 		{
 			donor = sk;
-			*donor_lsn = sk->appendResponse.flushLsn;
+			donor_lsn = sk->appendResponse.flushLsn;
 		}
 	}
-	return donor;
+
+        if(donor == NULL)
+        {
+            wp_log(WARNING, "UpdateDonorShmem didn't find a suitable donor, skipping");
+            return;
+        }
+
+        snprintf(donor_name, sizeof(donor_name), "%s:%s", donor->host, donor->port);
+	SpinLockAcquire(&wps->mutex);
+	memcpy(wps->donor_name, donor_name, sizeof(donor_name));
+        memcpy(wps->donor_conninfo, donor->conninfo, sizeof(donor->conninfo));
+	SpinLockRelease(&wps->mutex);
 }
 
 /*

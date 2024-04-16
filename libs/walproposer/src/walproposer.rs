@@ -17,7 +17,7 @@ use crate::{
 /// Refer to `pgxn/neon/walproposer.h` for documentation.
 pub trait ApiImpl {
     fn get_shmem_state(&self) -> *mut crate::bindings::WalproposerShmemState {
-        todo!()
+        unsafe { crate::bindings::GetWalpropShmemState() }
     }
 
     fn start_streaming(&self, _startpos: u64, _callback: &StreamingCallback) {
