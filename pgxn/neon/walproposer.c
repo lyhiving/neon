@@ -1632,10 +1632,14 @@ UpdateDonorShmem(WalProposer *wp)
         }
 
         snprintf(donor_name, sizeof(donor_name), "%s:%s", donor->host, donor->port);
+#ifndef WALPROPOSER_LIB
 	SpinLockAcquire(&wps->mutex);
+#endif
 	memcpy(wps->donor_name, donor_name, sizeof(donor_name));
         memcpy(wps->donor_conninfo, donor->conninfo, sizeof(donor->conninfo));
+#ifndef WALPROPOSER_LIB
 	SpinLockRelease(&wps->mutex);
+#endif
 }
 
 /*
