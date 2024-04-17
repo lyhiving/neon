@@ -11,14 +11,15 @@ use crate::tenant::block_io::BlockReader;
 use crate::tenant::ephemeral_file::EphemeralFile;
 use crate::tenant::storage_layer::ValueReconstructResult;
 use crate::tenant::timeline::GetVectoredError;
-use crate::tenant::{PageReconstructError, Timeline};
+use crate::tenant::PageReconstructError;
 use crate::{page_cache, walrecord};
 use anyhow::{anyhow, ensure, Result};
+use camino::Utf8PathBuf;
 use pageserver_api::keyspace::KeySpace;
 use pageserver_api::models::InMemoryLayerInfo;
 use pageserver_api::shard::TenantShardId;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::Instant;
 use tracing::*;
 use utils::{bin_ser::BeSer, id::TimelineId, lsn::Lsn, vec_map::VecMap};
@@ -33,7 +34,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 use tokio::sync::{RwLock, RwLockWriteGuard};
 
 use super::{
-    DeltaLayerWriter, ResidentLayer, ValueReconstructSituation, ValueReconstructState,
+    DeltaLayerWriter, PersistentLayerDesc, ValueReconstructSituation, ValueReconstructState,
     ValuesReconstructState,
 };
 
@@ -564,9 +565,8 @@ impl InMemoryLayer {
     /// Returns a new delta layer with all the same data as this in-memory layer
     pub(crate) async fn write_to_disk(
         &self,
-        timeline: &Arc<Timeline>,
         ctx: &RequestContext,
-    ) -> Result<ResidentLayer> {
+    ) -> Result<(PersistentLayerDesc, Utf8PathBuf)> {
         // Grab the lock in read-mode. We hold it over the I/O, but because this
         // layer is not writeable anymore, no one should be trying to acquire the
         // write lock on it, so we shouldn't block anyone. There's one exception
@@ -619,7 +619,6 @@ impl InMemoryLayer {
         }
 
         // MAX is used here because we identify L0 layers by full key range
-        let delta_layer = delta_layer_writer.finish(Key::MAX, timeline).await?;
-        Ok(delta_layer)
+        delta_layer_writer.finish(Key::MAX).await
     }
 }
