@@ -18,7 +18,7 @@ use camino::Utf8PathBuf;
 use pageserver_api::keyspace::KeySpace;
 use pageserver_api::models::InMemoryLayerInfo;
 use pageserver_api::shard::TenantShardId;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::sync::OnceLock;
 use std::time::Instant;
 use tracing::*;
@@ -76,7 +76,7 @@ pub struct InMemoryLayerInner {
     /// All versions of all pages in the layer are kept here.  Indexed
     /// by block number and LSN. The value is an offset into the
     /// ephemeral file where the page version is stored.
-    index: HashMap<Key, VecMap<Lsn, u64>>,
+    index: BTreeMap<Key, VecMap<Lsn, u64>>,
 
     /// The values are stored in a serialized format in this file.
     /// Each serialized Value is preceded by a 'u32' length field.
@@ -466,7 +466,7 @@ impl InMemoryLayer {
             end_lsn: OnceLock::new(),
             opened_at: Instant::now(),
             inner: RwLock::new(InMemoryLayerInner {
-                index: HashMap::new(),
+                index: BTreeMap::new(),
                 file,
                 resource_units: GlobalResourceUnits::new(),
             }),
