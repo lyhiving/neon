@@ -477,8 +477,7 @@ impl InMemoryLayer {
 
     /// Common subroutine of the public put_wal_record() and put_page_image() functions.
     /// Adds the page version to the in-memory tree
-
-    pub(crate) async fn put_value(
+    pub async fn put_value(
         &self,
         key: Key,
         lsn: Lsn,
@@ -563,7 +562,7 @@ impl InMemoryLayer {
     /// Write this frozen in-memory layer to disk.
     ///
     /// Returns a new delta layer with all the same data as this in-memory layer
-    pub(crate) async fn write_to_disk(
+    pub async fn write_to_disk(
         &self,
         ctx: &RequestContext,
     ) -> Result<(PersistentLayerDesc, Utf8PathBuf)> {
