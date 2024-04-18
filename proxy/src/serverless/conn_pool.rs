@@ -5,6 +5,7 @@ use pin_list::{InitializedNode, Node};
 use pin_project_lite::pin_project;
 use rand::Rng;
 use smallvec::SmallVec;
+use std::future::poll_fn;
 use std::pin::Pin;
 use std::{collections::HashMap, sync::Arc, sync::Weak, time::Duration};
 use std::{
@@ -227,48 +228,25 @@ impl<C: ClientInnerExt> Default for DbUserConnPool<C> {
 }
 
 impl<C: ClientInnerExt> DbUserConnPool<C> {
-    fn clear_closed_clients(&mut self, conns: &mut usize) -> usize {
-        let mut removed = 0;
-
-        let mut cursor = self.conns.cursor_front_mut();
-        while let Some(client) = cursor.protected() {
-            if client.conn.is_closed() {
-                let _ = cursor.remove_current(uuid::Uuid::nil());
-                removed += 1;
-            } else {
-                cursor.move_next()
-            }
-        }
-
-        *conns -= removed;
-        removed
-    }
-
     fn get_conn_entry(
         &mut self,
         conns: &mut usize,
         global_connections_count: &AtomicUsize,
         session_id: uuid::Uuid,
     ) -> Option<ConnPoolEntry<C>> {
-        let mut removed = self.clear_closed_clients(conns);
+        let mut cursor = self.conns.cursor_front_mut();
+        let conn = loop {
+            let client = cursor.remove_current(session_id).ok()?;
+            if !client.conn.is_closed() {
+                break client;
+            }
+        };
 
-        let conn = self
-            .conns
-            .cursor_front_mut()
-            .remove_current(session_id)
-            .ok();
+        *conns -= 1;
+        global_connections_count.fetch_sub(1, atomic::Ordering::Relaxed);
+        Metrics::get().proxy.http_pool_opened_connections.dec_by(1);
 
-        if conn.is_some() {
-            *conns -= 1;
-            removed += 1;
-        }
-        global_connections_count.fetch_sub(removed, atomic::Ordering::Relaxed);
-        Metrics::get()
-            .proxy
-            .http_pool_opened_connections
-            .get_metric()
-            .dec_by(removed as i64);
-        conn
+        Some(conn)
     }
 }
 
@@ -360,19 +338,11 @@ impl<C: ClientInnerExt> GlobalConnPool<C> {
             .http_pool_reclaimation_lag_seconds
             .start_timer();
         let current_len = shard.len();
-        let mut clients_removed = 0;
         shard.retain(|endpoint, x| {
             // if the current endpoint pool is unique (no other strong or weak references)
             // then it is currently not in use by any connections.
             if let Some(pool) = Arc::get_mut(x.get_mut()) {
-                let EndpointConnPool {
-                    pools, total_conns, ..
-                } = pool.get_mut();
-
-                // ensure that closed clients are removed
-                pools.iter_mut().for_each(|(_, db_pool)| {
-                    clients_removed += db_pool.clear_closed_clients(total_conns);
-                });
+                let EndpointConnPool { total_conns, .. } = pool.get_mut();
 
                 // we only remove this pool if it has no active connections
                 if *total_conns == 0 {
@@ -388,19 +358,6 @@ impl<C: ClientInnerExt> GlobalConnPool<C> {
         drop(shard);
         timer.observe();
 
-        // Do logging outside of the lock.
-        if clients_removed > 0 {
-            let size = self
-                .global_connections_count
-                .fetch_sub(clients_removed, atomic::Ordering::Relaxed)
-                - clients_removed;
-            Metrics::get()
-                .proxy
-                .http_pool_opened_connections
-                .get_metric()
-                .dec_by(clients_removed as i64);
-            info!("pool: performed global pool gc. removed {clients_removed} clients, total number of clients in pool is {size}");
-        }
         let removed = current_len - new_len;
 
         if removed > 0 {
@@ -513,7 +470,7 @@ pub fn poll_client<C: ClientInnerExt>(
     ctx: &mut RequestMonitoring,
     conn_info: ConnInfo,
     client: C,
-    connection: tokio_postgres::Connection<Socket, NoTlsStream>,
+    mut connection: tokio_postgres::Connection<Socket, NoTlsStream>,
     conn_id: uuid::Uuid,
     aux: MetricsAuxInfo,
 ) -> Client<C> {
@@ -522,9 +479,11 @@ pub fn poll_client<C: ClientInnerExt>(
 
     let span = info_span!(parent: None, "connection", %conn_id);
     let cold_start_info = ctx.cold_start_info;
-    span.in_scope(|| {
-        info!(cold_start_info = cold_start_info.as_str(), %conn_info, %session_id, "new connection");
+    let session_span = info_span!(parent: span.clone(), "", %session_id);
+    session_span.in_scope(|| {
+        info!(cold_start_info = cold_start_info.as_str(), %conn_info, "new connection");
     });
+
     let pool = match conn_info.endpoint_cache_key() {
         Some(endpoint) => Arc::downgrade(&global_pool.get_or_create_endpoint_pool(&endpoint)),
         None => Weak::new(),
@@ -545,11 +504,39 @@ pub fn poll_client<C: ClientInnerExt>(
         db_user: conn_info.db_and_user(),
         pool: pool.clone(),
 
-        session_id,
+        session_span,
 
         conn_gauge,
         conn_id,
-        connection,
+        connection: poll_fn(move |cx| {
+            loop {
+                let message = ready!(connection.poll_message(cx));
+                match message {
+                    Some(Ok(AsyncMessage::Notice(notice))) => {
+                        info!("notice: {}", notice);
+                    }
+                    Some(Ok(AsyncMessage::Notification(notif))) => {
+                        warn!(
+                            pid = notif.process_id(),
+                            channel = notif.channel(),
+                            "notification received"
+                        );
+                    }
+                    Some(Ok(_)) => {
+                        warn!("unknown message");
+                    }
+                    Some(Err(e)) => {
+                        error!("connection error: {}", e);
+                        break;
+                    }
+                    None => {
+                        info!("connection closed");
+                        break;
+                    }
+                }
+            }
+            Poll::Ready(())
+        }),
     };
 
     tokio::spawn(db_conn.instrument(span));
@@ -565,7 +552,7 @@ pub fn poll_client<C: ClientInnerExt>(
 }
 
 pin_project! {
-    struct DbConnection<C: ClientInnerExt> {
+    struct DbConnection<C: ClientInnerExt, Inner> {
         // Used to close the current conn if the client is dropped
         #[pin]
         cancelled: WaitForCancellationFutureOwned,
@@ -583,16 +570,28 @@ pin_project! {
         pool: Weak<RwLock<EndpointConnPool<C>>>,
 
         // Used for reporting the current session the conn is attached to
-        session_id: uuid::Uuid,
+        session_span: tracing::Span,
 
         // Static connection state
         conn_gauge: NumDbConnectionsGuard<'static>,
         conn_id: uuid::Uuid,
-        connection: tokio_postgres::Connection<Socket, NoTlsStream>,
+        #[pin]
+        connection: Inner,
+    }
+
+    impl<C: ClientInnerExt, I> PinnedDrop for DbConnection<C, I> {
+        fn drop(this: Pin<&mut Self>) {
+            let mut this = this.project();
+            let Some(pool) = this.pool.upgrade() else { return };
+            let Some(init) = this.node.as_mut().initialized_mut() else { return };
+            if pool.write().remove_client(this.db_user.clone(), init) {
+                info!("closed connection removed");
+            }
+        }
     }
 }
 
-impl<C: ClientInnerExt> Future for DbConnection<C> {
+impl<C: ClientInnerExt, Inner: Future> Future for DbConnection<C, Inner> {
     type Output = ();
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
@@ -610,9 +609,10 @@ impl<C: ClientInnerExt> Future for DbConnection<C> {
 
         if let Some(init) = this.node.as_mut().initialized_mut() {
             if let Some(entry) = pool.read().pools.get(this.db_user) {
-                if let Ok((session, _)) = init.take_removed(&entry.conns) {
-                    *this.session_id = session;
-                    info!(session_id = %this.session_id, "changed session");
+                if let Ok((session_id, _)) = init.take_removed(&entry.conns) {
+                    *this.session_span = info_span!("", %session_id);
+                    let _span = this.session_span.enter();
+                    info!("changed session");
                     this.idle_timeout
                         .as_mut()
                         .reset(Instant::now() + *this.idle);
@@ -650,36 +650,8 @@ impl<C: ClientInnerExt> Future for DbConnection<C> {
             }
         }
 
-        loop {
-            let message = ready!(this.connection.poll_message(cx));
-
-            match message {
-                Some(Ok(AsyncMessage::Notice(notice))) => {
-                    info!(session_id = %this.session_id, "notice: {}", notice);
-                }
-                Some(Ok(AsyncMessage::Notification(notif))) => {
-                    warn!(session_id = %this.session_id, pid = notif.process_id(), channel = notif.channel(), "notification received");
-                }
-                Some(Ok(_)) => {
-                    warn!(session_id = %this.session_id, "unknown message");
-                }
-                Some(Err(e)) => {
-                    error!(session_id = %this.session_id, "connection error: {}", e);
-                    break;
-                }
-                None => {
-                    info!("connection closed");
-                    break;
-                }
-            }
-        }
-
-        // remove from connection pool
-        if let Some(init) = this.node.as_mut().initialized_mut() {
-            if pool.write().remove_client(this.db_user.clone(), init) {
-                info!("closed connection removed");
-            }
-        }
+        let _span = this.session_span.enter();
+        ready!(this.connection.poll(cx));
 
         Poll::Ready(())
     }
