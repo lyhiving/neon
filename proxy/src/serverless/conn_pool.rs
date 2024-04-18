@@ -1,9 +1,11 @@
 use dashmap::DashMap;
 use futures::Future;
 use parking_lot::RwLock;
+use pin_list::Node;
 use pin_project_lite::pin_project;
 use rand::Rng;
 use smallvec::SmallVec;
+use std::pin::Pin;
 use std::{collections::HashMap, sync::Arc, sync::Weak, time::Duration};
 use std::{
     fmt,
@@ -13,6 +15,7 @@ use std::{
     ops::Deref,
     sync::atomic::{self, AtomicUsize},
 };
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Instant, Sleep};
 use tokio_postgres::tls::NoTlsStream;
 use tokio_postgres::{AsyncMessage, ReadyForQueryStatus, Socket};
@@ -84,7 +87,11 @@ pub struct EndpointConnPool<C: ClientInnerExt> {
 }
 
 impl<C: ClientInnerExt> EndpointConnPool<C> {
-    fn get_conn_entry(&mut self, db_user: (DbName, RoleName)) -> Option<ConnPoolEntry<C>> {
+    fn get_conn_entry(
+        &mut self,
+        db_user: (DbName, RoleName),
+        session_id: uuid::Uuid,
+    ) -> Option<ConnPoolEntry<C>> {
         let Self {
             pools,
             total_conns,
@@ -92,7 +99,7 @@ impl<C: ClientInnerExt> EndpointConnPool<C> {
             ..
         } = self;
         pools.get_mut(&db_user).and_then(|pool_entries| {
-            pool_entries.get_conn_entry(total_conns, global_connections_count)
+            pool_entries.get_conn_entry(total_conns, global_connections_count, session_id)
         })
     }
 
@@ -104,10 +111,17 @@ impl<C: ClientInnerExt> EndpointConnPool<C> {
             ..
         } = self;
         if let Some(pool) = pools.get_mut(&db_user) {
-            let old_len = pool.conns.len();
-            pool.conns.retain(|conn| conn.conn.conn_id != conn_id);
-            let new_len = pool.conns.len();
-            let removed = old_len - new_len;
+            let mut removed = 0;
+            let mut cursor = pool.conns2.cursor_front_mut();
+            while let Some(client) = cursor.protected() {
+                if client.conn.conn_id != conn_id {
+                    let _ = cursor.remove_current(uuid::Uuid::nil());
+                    removed += 1;
+                } else {
+                    cursor.move_next()
+                }
+            }
+
             if removed > 0 {
                 global_connections_count.fetch_sub(removed, atomic::Ordering::Relaxed);
                 Metrics::get()
@@ -123,7 +137,13 @@ impl<C: ClientInnerExt> EndpointConnPool<C> {
         }
     }
 
-    fn put(pool: &RwLock<Self>, conn_info: &ConnInfo, client: ClientInner<C>) {
+    fn put(
+        pool: &RwLock<Self>,
+        mut node: Pin<&mut Node<PinListTypes<C>>>,
+        db_user: &(DbName, RoleName),
+        client: ClientInner<C>,
+        conn_info: ConnInfo,
+    ) -> bool {
         let conn_id = client.conn_id;
 
         {
@@ -134,7 +154,7 @@ impl<C: ClientInnerExt> EndpointConnPool<C> {
                 >= pool.global_pool_size_max_conns
             {
                 info!(%conn_id, "pool: throwing away connection '{conn_info}' because pool is full");
-                return;
+                return false;
             }
         }
 
@@ -145,14 +165,24 @@ impl<C: ClientInnerExt> EndpointConnPool<C> {
             let mut pool = pool.write();
 
             if pool.total_conns < pool.max_conns {
-                let pool_entries = pool.pools.entry(conn_info.db_and_user()).or_default();
-                pool_entries.conns.push(ConnPoolEntry {
-                    conn: client,
-                    _last_access: std::time::Instant::now(),
-                });
+                let pool_entries = pool.pools.entry(db_user.clone()).or_default();
+
+                if let Some(node) = node.as_mut().initialized_mut() {
+                    if node.take_removed(&pool_entries.conns2).is_err() {
+                        panic!("client is already in the pool")
+                    };
+                }
+                pool_entries.conns2.cursor_front_mut().insert_after(
+                    node,
+                    ConnPoolEntry {
+                        conn: client,
+                        _last_access: std::time::Instant::now(),
+                    },
+                    (),
+                );
 
                 returned = true;
-                per_db_size = pool_entries.conns.len();
+                per_db_size = pool_entries.len;
 
                 pool.total_conns += 1;
                 pool.global_connections_count
@@ -173,6 +203,8 @@ impl<C: ClientInnerExt> EndpointConnPool<C> {
         } else {
             info!(%conn_id, "pool: throwing away connection '{conn_info}' because pool is full, total_conns={total_conns}");
         }
+
+        returned
     }
 }
 
@@ -191,23 +223,33 @@ impl<C: ClientInnerExt> Drop for EndpointConnPool<C> {
 }
 
 pub struct DbUserConnPool<C: ClientInnerExt> {
-    conns: Vec<ConnPoolEntry<C>>,
+    conns2: pin_list::PinList<PinListTypes<C>>,
+    len: usize,
 }
 
 impl<C: ClientInnerExt> Default for DbUserConnPool<C> {
     fn default() -> Self {
-        Self { conns: Vec::new() }
+        Self {
+            conns2: pin_list::PinList::new(pin_list::id::Checked::new()),
+            len: 0,
+        }
     }
 }
 
 impl<C: ClientInnerExt> DbUserConnPool<C> {
     fn clear_closed_clients(&mut self, conns: &mut usize) -> usize {
-        let old_len = self.conns.len();
+        let mut removed = 0;
 
-        self.conns.retain(|conn| !conn.conn.is_closed());
+        let mut cursor = self.conns2.cursor_front_mut();
+        while let Some(client) = cursor.protected() {
+            if client.conn.is_closed() {
+                let _ = cursor.remove_current(uuid::Uuid::nil());
+                removed += 1;
+            } else {
+                cursor.move_next()
+            }
+        }
 
-        let new_len = self.conns.len();
-        let removed = old_len - new_len;
         *conns -= removed;
         removed
     }
@@ -216,9 +258,16 @@ impl<C: ClientInnerExt> DbUserConnPool<C> {
         &mut self,
         conns: &mut usize,
         global_connections_count: &AtomicUsize,
+        session_id: uuid::Uuid,
     ) -> Option<ConnPoolEntry<C>> {
         let mut removed = self.clear_closed_clients(conns);
-        let conn = self.conns.pop();
+
+        let conn = self
+            .conns2
+            .cursor_front_mut()
+            .remove_current(session_id)
+            .ok();
+
         if conn.is_some() {
             *conns -= 1;
             removed += 1;
@@ -386,7 +435,7 @@ impl<C: ClientInnerExt> GlobalConnPool<C> {
         let endpoint_pool = self.get_or_create_endpoint_pool(&endpoint);
         if let Some(entry) = endpoint_pool
             .write()
-            .get_conn_entry(conn_info.db_and_user())
+            .get_conn_entry(conn_info.db_and_user(), ctx.session_id)
         {
             client = Some(entry.conn)
         }
@@ -461,12 +510,21 @@ impl<C: ClientInnerExt> GlobalConnPool<C> {
     }
 }
 
-pub fn poll_client<C: ClientInnerExt>(
+type PinListTypes<C> = dyn pin_list::Types<
+    Id = pin_list::id::Checked,
+    Protected = ConnPoolEntry<C>,
+    // session ID
+    Removed = uuid::Uuid,
+    // conn ID
+    Unprotected = (),
+>;
+
+pub async fn poll_client<C: ClientInnerExt>(
     global_pool: Arc<GlobalConnPool<C>>,
     ctx: &mut RequestMonitoring,
     conn_info: ConnInfo,
     client: C,
-    mut connection: tokio_postgres::Connection<Socket, NoTlsStream>,
+    connection: tokio_postgres::Connection<Socket, NoTlsStream>,
     conn_id: uuid::Uuid,
     aux: MetricsAuxInfo,
 ) -> Client<C> {
@@ -487,26 +545,32 @@ pub fn poll_client<C: ClientInnerExt>(
     let idle = global_pool.get_idle_timeout();
     let cancel = CancellationToken::new();
 
+    let (send_client, recv_client) = tokio::sync::mpsc::channel(1);
     let db_conn = DbConnection {
         cancelled: cancel.clone().cancelled_owned(),
+
         idle_timeout: tokio::time::sleep(idle),
         idle,
+
+        node: Node::<PinListTypes<C>>::new(),
+        recv_client,
         db_user: conn_info.db_and_user(),
         pool: pool.clone(),
+
         session_id,
         session_rx: rx,
+
         conn_gauge,
         conn_id,
         connection,
     };
 
-    tokio::spawn(async move {
-        db_conn.instrument(span).await;
-    });
+    tokio::spawn(db_conn.instrument(span));
 
     let inner = ClientInner {
         inner: client,
         session: tx,
+        pool: send_client,
         cancel,
         aux,
         conn_id,
@@ -516,19 +580,27 @@ pub fn poll_client<C: ClientInnerExt>(
 
 pin_project! {
     struct DbConnection<C: ClientInnerExt> {
+        // Used to close the current conn if the client is dropped
         #[pin]
         cancelled: WaitForCancellationFutureOwned,
 
+        // Used to close the current conn if it's idle
         #[pin]
         idle_timeout: Sleep,
         idle: tokio::time::Duration,
 
+        // Used to add/remove conn from the conn pool
+        #[pin]
+        node: Node<PinListTypes<C>>,
+        recv_client: tokio::sync::mpsc::Receiver<(tracing::Span, ClientInner<C>, ConnInfo)>,
         db_user: (DbName, RoleName),
         pool: Weak<RwLock<EndpointConnPool<C>>>,
 
+        // Used for reporting the current session the conn is attached to
         session_id: uuid::Uuid,
         session_rx: tokio::sync::watch::Receiver<uuid::Uuid>,
 
+        // Static connection state
         conn_gauge: NumDbConnectionsGuard<'static>,
         conn_id: uuid::Uuid,
         connection: tokio_postgres::Connection<Socket, NoTlsStream>,
@@ -543,6 +615,24 @@ impl<C: ClientInnerExt> Future for DbConnection<C> {
         if this.cancelled.as_mut().poll(cx).is_ready() {
             info!("connection dropped");
             return Poll::Ready(());
+        }
+
+        if let Poll::Ready(client) = this.recv_client.poll_recv(cx) {
+            // if the send_client is dropped, then the client is dropped
+            let Some((span, client, conn_info)) = client else {
+                info!("connection dropped");
+                return Poll::Ready(());
+            };
+            // if there's no pool, then this client will be closed.
+            let Some(pool) = this.pool.upgrade() else {
+                info!("connection dropped");
+                return Poll::Ready(());
+            };
+
+            let _span = span.enter();
+            if !EndpointConnPool::put(&*pool, this.node.as_mut(), this.db_user, client, conn_info) {
+                return Poll::Ready(());
+            }
         }
 
         match this.session_rx.has_changed() {
@@ -566,7 +656,7 @@ impl<C: ClientInnerExt> Future for DbConnection<C> {
                 .as_mut()
                 .reset(Instant::now() + *this.idle);
             info!("connection idle");
-            if let Some(pool) = this.pool.clone().upgrade() {
+            if let Some(pool) = this.pool.upgrade() {
                 // remove client from pool - should close the connection if it's idle.
                 // does nothing if the client is currently checked-out and in-use
                 if pool
@@ -619,6 +709,7 @@ impl<C: ClientInnerExt> Future for DbConnection<C> {
 struct ClientInner<C: ClientInnerExt> {
     inner: C,
     session: tokio::sync::watch::Sender<uuid::Uuid>,
+    pool: tokio::sync::mpsc::Sender<(tracing::Span, ClientInner<C>, ConnInfo)>,
     cancel: CancellationToken,
     aux: MetricsAuxInfo,
     conn_id: uuid::Uuid,
@@ -726,7 +817,7 @@ impl<C: ClientInnerExt> Deref for Client<C> {
 }
 
 impl<C: ClientInnerExt> Client<C> {
-    fn do_drop(&mut self) -> Option<impl FnOnce()> {
+    fn do_drop(&mut self) {
         let conn_info = self.conn_info.clone();
         let client = self
             .inner
@@ -737,26 +828,23 @@ impl<C: ClientInnerExt> Client<C> {
 
         if client.is_closed() {
             info!(%conn_id, "pool: throwing away connection '{conn_info}' because connection is closed");
-            return None;
+            return;
         }
 
-        if let Some(conn_pool) = std::mem::take(&mut self.pool).upgrade() {
-            let current_span = self.span.clone();
-            // return connection to the pool
-            return Some(move || {
-                let _span = current_span.enter();
-                EndpointConnPool::put(&conn_pool, &conn_info, client);
-            });
+        let tx = client.pool.clone();
+        match tx.try_send((self.span.clone(), client, self.conn_info.clone())) {
+            Ok(_) => {}
+            Err(TrySendError::Closed(_)) => {}
+            Err(TrySendError::Full(_)) => {
+                error!("client channel should not be full")
+            }
         }
-        None
     }
 }
 
 impl<C: ClientInnerExt> Drop for Client<C> {
     fn drop(&mut self) {
-        if let Some(drop) = self.do_drop() {
-            tokio::task::spawn_blocking(drop);
-        }
+        self.do_drop()
     }
 }
 
@@ -788,10 +876,12 @@ mod tests {
     }
 
     fn create_inner_with(client: MockClient) -> ClientInner<MockClient> {
+        let (tx, _) = tokio::sync::mpsc::channel(1);
         ClientInner {
             inner: client,
             session: tokio::sync::watch::Sender::new(uuid::Uuid::new_v4()),
             cancel: CancellationToken::new(),
+            pool: tx,
             aux: MetricsAuxInfo {
                 endpoint_id: (&EndpointId::from("endpoint")).into(),
                 project_id: (&ProjectId::from("project")).into(),
@@ -838,7 +928,7 @@ mod tests {
         }
         {
             let mut client = Client::new(create_inner(), conn_info.clone(), ep_pool.clone());
-            client.do_drop().unwrap()();
+            client.do_drop();
             mem::forget(client); // drop the client
             assert_eq!(1, pool.get_global_connections_count());
         }
@@ -848,7 +938,7 @@ mod tests {
                 conn_info.clone(),
                 ep_pool.clone(),
             );
-            closed_client.do_drop().unwrap()();
+            closed_client.do_drop();
             mem::forget(closed_client); // drop the client
                                         // The closed client shouldn't be added to the pool.
             assert_eq!(1, pool.get_global_connections_count());
@@ -860,7 +950,7 @@ mod tests {
                 conn_info.clone(),
                 ep_pool.clone(),
             );
-            client.do_drop().unwrap()();
+            client.do_drop();
             mem::forget(client); // drop the client
 
             // The client should be added to the pool.
@@ -868,7 +958,7 @@ mod tests {
         }
         {
             let mut client = Client::new(create_inner(), conn_info, ep_pool);
-            client.do_drop().unwrap()();
+            client.do_drop();
             mem::forget(client); // drop the client
 
             // The client shouldn't be added to the pool. Because the ep-pool is full.
@@ -889,13 +979,13 @@ mod tests {
         );
         {
             let mut client = Client::new(create_inner(), conn_info.clone(), ep_pool.clone());
-            client.do_drop().unwrap()();
+            client.do_drop();
             mem::forget(client); // drop the client
             assert_eq!(3, pool.get_global_connections_count());
         }
         {
             let mut client = Client::new(create_inner(), conn_info.clone(), ep_pool.clone());
-            client.do_drop().unwrap()();
+            client.do_drop();
             mem::forget(client); // drop the client
 
             // The client shouldn't be added to the pool. Because the global pool is full.
