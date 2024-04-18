@@ -465,12 +465,54 @@ type ConnTypes<C> = dyn pin_list::Types<
     Unprotected = (),
 >;
 
-pub fn poll_client<C: ClientInnerExt>(
+
+pub fn poll_tokio_client(
+    global_pool: Arc<GlobalConnPool<tokio_postgres::Client>>,
+    ctx: &mut RequestMonitoring,
+    conn_info: ConnInfo,
+    client: tokio_postgres::Client,
+    mut connection: tokio_postgres::Connection<Socket, NoTlsStream>,
+    conn_id: uuid::Uuid,
+    aux: MetricsAuxInfo,
+) -> Client<tokio_postgres::Client> {
+    let connection = poll_fn(move |cx| {
+        loop {
+            let message = ready!(connection.poll_message(cx));
+            match message {
+                Some(Ok(AsyncMessage::Notice(notice))) => {
+                    info!("notice: {}", notice);
+                }
+                Some(Ok(AsyncMessage::Notification(notif))) => {
+                    warn!(
+                        pid = notif.process_id(),
+                        channel = notif.channel(),
+                        "notification received"
+                    );
+                }
+                Some(Ok(_)) => {
+                    warn!("unknown message");
+                }
+                Some(Err(e)) => {
+                    error!("connection error: {}", e);
+                    break;
+                }
+                None => {
+                    info!("connection closed");
+                    break;
+                }
+            }
+        }
+        Poll::Ready(())
+    });
+    poll_client(global_pool, ctx, conn_info, client, connection, conn_id, aux)
+}
+
+pub fn poll_client<C: ClientInnerExt, I: Future + Send + 'static>(
     global_pool: Arc<GlobalConnPool<C>>,
     ctx: &mut RequestMonitoring,
     conn_info: ConnInfo,
     client: C,
-    mut connection: tokio_postgres::Connection<Socket, NoTlsStream>,
+    connection: I,
     conn_id: uuid::Uuid,
     aux: MetricsAuxInfo,
 ) -> Client<C> {
@@ -508,35 +550,7 @@ pub fn poll_client<C: ClientInnerExt>(
 
         conn_gauge,
         conn_id,
-        connection: poll_fn(move |cx| {
-            loop {
-                let message = ready!(connection.poll_message(cx));
-                match message {
-                    Some(Ok(AsyncMessage::Notice(notice))) => {
-                        info!("notice: {}", notice);
-                    }
-                    Some(Ok(AsyncMessage::Notification(notif))) => {
-                        warn!(
-                            pid = notif.process_id(),
-                            channel = notif.channel(),
-                            "notification received"
-                        );
-                    }
-                    Some(Ok(_)) => {
-                        warn!("unknown message");
-                    }
-                    Some(Err(e)) => {
-                        error!("connection error: {}", e);
-                        break;
-                    }
-                    None => {
-                        info!("connection closed");
-                        break;
-                    }
-                }
-            }
-            Poll::Ready(())
-        }),
+        connection,
     };
 
     tokio::spawn(db_conn.instrument(span));

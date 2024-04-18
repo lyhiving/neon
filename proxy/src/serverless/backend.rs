@@ -16,7 +16,7 @@ use crate::{
     proxy::connect_compute::ConnectMechanism,
 };
 
-use super::conn_pool::{poll_client, Client, ConnInfo, GlobalConnPool};
+use super::conn_pool::{poll_tokio_client, Client, ConnInfo, GlobalConnPool};
 
 pub struct PoolingBackend {
     pub pool: Arc<GlobalConnPool<tokio_postgres::Client>>,
@@ -180,7 +180,7 @@ impl ConnectMechanism for TokioMechanism {
         let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
 
         tracing::Span::current().record("pid", &tracing::field::display(client.get_process_id()));
-        Ok(poll_client(
+        Ok(poll_tokio_client(
             self.pool.clone(),
             ctx,
             self.conn_info.clone(),
