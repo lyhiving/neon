@@ -20,7 +20,6 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Instant, Sleep};
 use tokio_postgres::tls::NoTlsStream;
 use tokio_postgres::{AsyncMessage, ReadyForQueryStatus, Socket};
-use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use crate::console::messages::{ColdStartInfo, MetricsAuxInfo};
 use crate::metrics::{HttpEndpointPoolsGuard, Metrics, NumDbConnectionsGuard};
@@ -537,12 +536,9 @@ pub fn poll_client<C: ClientInnerExt, I: Future<Output = ()> + Send + 'static>(
         .map(|endpoint| global_pool.get_or_create_endpoint_pool(&endpoint));
 
     let idle = global_pool.get_idle_timeout();
-    let cancel = CancellationToken::new();
 
     let (send_client, recv_client) = tokio::sync::mpsc::channel(1);
     let db_conn = DbConnection {
-        cancelled: cancel.clone().cancelled_owned(),
-
         idle_timeout: tokio::time::sleep(idle),
         idle,
 
@@ -563,7 +559,6 @@ pub fn poll_client<C: ClientInnerExt, I: Future<Output = ()> + Send + 'static>(
     let inner = ClientInner {
         inner: client,
         pool: send_client,
-        cancel,
         aux,
         conn_id,
     };
@@ -572,10 +567,6 @@ pub fn poll_client<C: ClientInnerExt, I: Future<Output = ()> + Send + 'static>(
 
 pin_project! {
     struct DbConnection<C: ClientInnerExt, Inner> {
-        // Used to close the current conn if the client is dropped
-        #[pin]
-        cancelled: WaitForCancellationFutureOwned,
-
         // Used to close the current conn if it's idle
         #[pin]
         idle_timeout: Sleep,
@@ -615,19 +606,20 @@ impl<C: ClientInnerExt, Inner: Future<Output = ()>> Future for DbConnection<C, I
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
-        if this.cancelled.as_mut().poll(cx).is_ready() {
-            info!("connection dropped");
-            return Poll::Ready(());
-        }
-
         // node is initiated via EndpointConnPool::put.
         // this is only called in the if statement below.
         // this can only occur if pool is set (and pool is never removed).
         // when this occurs, it guarantees that the DbUserConnPool is created (it is never removed).
         if let Some(init) = this.node.as_mut().initialized_mut() {
-            let pool = this.pool.as_ref().expect("node cannot be init without pool");
+            let pool = this
+                .pool
+                .as_ref()
+                .expect("node cannot be init without pool");
             let pool = pool.read();
-            let pool = pool.pools.get(this.db_user).expect("node cannot be init without pool");
+            let pool = pool
+                .pools
+                .get(this.db_user)
+                .expect("node cannot be init without pool");
             if let Ok((session_id, _)) = init.take_removed(&pool.conns) {
                 *this.session_span = info_span!("", %session_id);
                 let _span = this.session_span.enter();
@@ -683,16 +675,8 @@ impl<C: ClientInnerExt, Inner: Future<Output = ()>> Future for DbConnection<C, I
 struct ClientInner<C: ClientInnerExt> {
     inner: C,
     pool: tokio::sync::mpsc::Sender<(tracing::Span, ClientInner<C>, ConnInfo)>,
-    cancel: CancellationToken,
     aux: MetricsAuxInfo,
     conn_id: uuid::Uuid,
-}
-
-impl<C: ClientInnerExt> Drop for ClientInner<C> {
-    fn drop(&mut self) {
-        // on client drop, tell the conn to shut down
-        self.cancel.cancel();
-    }
 }
 
 pub trait ClientInnerExt: Sync + Send + 'static {
