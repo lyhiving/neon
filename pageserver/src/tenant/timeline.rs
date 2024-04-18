@@ -40,7 +40,6 @@ use utils::{
     vec_map::VecMap,
 };
 
-use std::ops::{Deref, Range};
 use std::pin::pin;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -53,6 +52,10 @@ use std::{
 use std::{
     cmp::{max, min, Ordering},
     ops::ControlFlow,
+};
+use std::{
+    ops::{Deref, Range},
+    sync::atomic::AtomicBool,
 };
 
 use crate::deletion_queue::DeletionQueueClient;
@@ -372,6 +375,9 @@ pub struct Timeline {
 
     /// Keep aux directory cache to avoid it's reconstruction on each update
     pub(crate) aux_files: tokio::sync::Mutex<AuxFilesState>,
+
+    /// Indicate whether aux file v2 storage is enabled.
+    pub(crate) aux_file_v2: AtomicBool,
 }
 
 pub struct WalReceiverInfo {
@@ -1668,6 +1674,14 @@ const REPARTITION_FREQ_IN_CHECKPOINT_DISTANCE: u64 = 10;
 
 // Private functions
 impl Timeline {
+    pub(crate) fn get_try_enable_aux_file_v2(&self) -> bool {
+        let tenant_conf = self.tenant_conf.load();
+        tenant_conf
+            .tenant_conf
+            .try_enable_aux_file_v2
+            .unwrap_or(self.conf.default_tenant_conf.try_enable_aux_file_v2)
+    }
+
     pub(crate) fn get_lazy_slru_download(&self) -> bool {
         let tenant_conf = self.tenant_conf.load();
         tenant_conf
@@ -1915,6 +1929,8 @@ impl Timeline {
                     dir: None,
                     n_deltas: 0,
                 }),
+
+                aux_file_v2: AtomicBool::new(false),
             };
             result.repartition_threshold =
                 result.get_checkpoint_distance() / REPARTITION_FREQ_IN_CHECKPOINT_DISTANCE;
@@ -3554,6 +3570,7 @@ impl Timeline {
             *self.latest_gc_cutoff_lsn.read(),
             self.initdb_lsn,
             self.pg_version,
+            self.aux_file_v2.load(AtomicOrdering::SeqCst),
         );
 
         fail_point!("checkpoint-before-saving-metadata", |x| bail!(

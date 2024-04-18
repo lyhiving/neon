@@ -1398,6 +1398,25 @@ impl<'a> DatadirModification<'a> {
             Some(Bytes::copy_from_slice(content))
         };
 
+        // TODO: either ensure we don't flip the flag for users with existing AUX files, or do a check there.
+        let aux_file_v2 = {
+            let tline_aux_file_v2 = self
+                .tline
+                .aux_file_v2
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if self.tline.get_try_enable_aux_file_v2() && !tline_aux_file_v2 {
+                // The next index part upload will have `aux_file_v2` to `true`.
+                self.tline
+                    .aux_file_v2
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            } else {
+                tline_aux_file_v2
+            }
+        };
+
+        drop(aux_file_v2);
+
         let n_files;
         let mut aux_files = self.tline.aux_files.lock().await;
         if let Some(mut dir) = aux_files.dir.take() {
